@@ -4034,6 +4034,18 @@ fn lock_conflicting_workspace_members_depends_direct_extra() -> Result<()> {
      - subexample==0.1.0 (from file://[TEMP_DIR]/subexample)
     ");
 
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("package-conflicts,lock-without-metadata").arg("--locked").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 4 packages in [TIME]
+    ");
+
     Ok(())
 }
 
@@ -4333,6 +4345,18 @@ fn lock_conflicting_workspace_members_depends_transitive_extra() -> Result<()> {
     Installed 2 packages in [TIME]
      + sortedcontainers==2.4.0
      + subexample==0.1.0 (from file://[TEMP_DIR]/subexample)
+    ");
+
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("package-conflicts,lock-without-metadata").arg("--locked").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 5 packages in [TIME]
     ");
 
     Ok(())
@@ -4699,6 +4723,18 @@ fn lock_conflicting_mixed() -> Result<()> {
     exit_code: 2 (failure)
     ----- stderr -----
     error: Extra `project2` and group `project1` are incompatible with the declared conflicts: {`project[project2]`, `project:project1`}
+    ");
+
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
     ");
 
     Ok(())
@@ -5219,6 +5255,18 @@ fn lock_check_refresh_workspace_conflicts() -> Result<()> {
     assert_eq!(lock, context.read("uv.lock"));
 
     uv_snapshot!(context.filters(), context.lock().arg("--check").arg("--refresh"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 4 packages in [TIME]
+    ");
+
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--offline"), @"
     exit_code: 0 (success)
     ----- stderr -----
     Resolved 4 packages in [TIME]
@@ -18414,6 +18462,160 @@ fn lock_regenerates_activated_empty_extra() -> Result<()> {
     Ok(())
 }
 
+/// Extras and groups remain selectable when all of their requirements resolve to no edges.
+#[cfg(feature = "test-universal")]
+#[test]
+fn lock_metadata_free_frozen_filtered_dependency_selections() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+
+        [project.optional-dependencies]
+        empty = []
+        excluded = ["excluded-dependency"]
+        inapplicable = ["inapplicable-dependency ; python_version < '3.0'"]
+
+        [dependency-groups]
+        empty = []
+        excluded = ["excluded-dependency"]
+        inapplicable = ["inapplicable-dependency ; python_version < '3.0'"]
+        included = [{ include-group = "empty" }]
+
+        [tool.uv]
+        dev-dependencies = []
+        exclude-dependencies = ["excluded-dependency"]
+        "#})?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    warning: The `tool.uv.dev-dependencies` field (used in `pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+    Resolved 1 package in [TIME]
+    ");
+
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.sync()
+        .arg("--preview-features")
+        .arg("lock-without-metadata")
+        .arg("--frozen")
+        .arg("--extra")
+        .arg("empty")
+        .arg("--extra")
+        .arg("excluded")
+        .arg("--extra")
+        .arg("inapplicable")
+        .arg("--group")
+        .arg("empty")
+        .arg("--group")
+        .arg("excluded")
+        .arg("--group")
+        .arg("inapplicable")
+        .arg("--group")
+        .arg("included")
+        .arg("--group")
+        .arg("dev"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    warning: The `tool.uv.dev-dependencies` field (used in `pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+    Checked in [TIME]
+    ");
+
+    Ok(())
+}
+
+/// Lockfile revision 1.4 must retain frozen selection semantics.
+#[cfg(feature = "test-universal")]
+#[test]
+fn lock_metadata_free_frozen_preserves_recorded_selections() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    let original_pyproject = indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["dependency"]
+
+        [project.optional-dependencies]
+        original = ["dependency"]
+
+        [dependency-groups]
+        original = ["dependency"]
+
+        [tool.uv.sources]
+        dependency = { path = "dependency" }
+        "#};
+    pyproject_toml.write_str(original_pyproject)?;
+    context
+        .temp_dir
+        .child("dependency/pyproject.toml")
+        .write_str(indoc! {r#"
+            [project]
+            name = "dependency"
+            version = "1.0.0"
+            requires-python = ">=3.12"
+            "#})?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    ");
+
+    let mut lock = context.read("uv.lock").parse::<toml_edit::DocumentMut>()?;
+    lock["revision"] = toml_edit::value(4);
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    // Revision-4 lockfiles that retain metadata do not require the preview feature.
+    uv_snapshot!(context.filters(), context.lock().arg("--locked").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    ");
+
+    pyproject_toml.write_str(&original_pyproject.replace("original =", "added ="))?;
+
+    uv_snapshot!(context.filters(), context.sync().arg("--frozen").arg("--extra").arg("original"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + dependency==1.0.0 (from file://[TEMP_DIR]/dependency)
+    ");
+    uv_snapshot!(context.filters(), context.sync().arg("--frozen").arg("--extra").arg("added"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Extra `added` is not defined in the `optional-dependencies` table for `project`
+    ");
+
+    uv_snapshot!(context.filters(), context.sync().arg("--frozen").arg("--group").arg("original"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Checked 1 package in [TIME]
+    ");
+    uv_snapshot!(context.filters(), context.sync().arg("--frozen").arg("--group").arg("added"), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    error: Group `added` is not defined in the project's `dependency-groups` table
+    ");
+
+    Ok(())
+}
+
 /// Refreshing an extra on a local dependency must respect marker-specific activation.
 #[cfg(feature = "test-universal")]
 #[test]
@@ -26969,6 +27171,18 @@ fn lock_extra_marker_preserves_production_platform() -> Result<()> {
         # via project
     ");
 
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    ");
+
     Ok(())
 }
 
@@ -27557,6 +27771,18 @@ fn lock_group_include() -> Result<()> {
         );
     });
 
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 11 packages in [TIME]
+    ");
+
     Ok(())
 }
 
@@ -27672,6 +27898,18 @@ fn lock_group_requires_python() -> Result<()> {
         "#
         );
     });
+
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 5 packages in [TIME]
+    ");
 
     Ok(())
 }
@@ -27820,6 +28058,18 @@ fn lock_group_includes_requires_python() -> Result<()> {
         "#
         );
     });
+
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 5 packages in [TIME]
+    ");
 
     Ok(())
 }
@@ -29486,6 +29736,18 @@ fn lock_dynamic_version_self_extra_hatchling() -> Result<()> {
     Resolved 5 packages in [TIME]
     ");
 
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 5 packages in [TIME]
+    ");
+
     Ok(())
 }
 
@@ -29633,6 +29895,18 @@ fn lock_dynamic_version_self_extra_setuptools() -> Result<()> {
 
     // Running with `--offline` should also succeed.
     uv_snapshot!(context.filters(), context.lock().arg("--locked").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 5 packages in [TIME]
+    ");
+
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--offline"), @"
     exit_code: 0 (success)
     ----- stderr -----
     Resolved 5 packages in [TIME]
@@ -30832,6 +31106,18 @@ fn lock_recursive_extra() -> Result<()> {
 
     // Re-run with `--locked`.
     uv_snapshot!(context.filters(), context.lock().arg("--locked"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    ");
+
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--offline"), @"
     exit_code: 0 (success)
     ----- stderr -----
     Resolved 2 packages in [TIME]
