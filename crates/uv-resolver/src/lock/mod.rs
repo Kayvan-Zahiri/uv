@@ -757,7 +757,7 @@ struct DependencySources {
     extra_markers: FxHashMap<PackageId, FxHashMap<ExtraName, MarkerTree>>,
 }
 
-/// Reconstruct the dependency sections implied by refreshed workspace declarations.
+/// Reconstruct the dependency sections implied by refreshed package declarations.
 struct ExpectedPackageDependencies<'lock> {
     lock: &'lock Lock,
     package: &'lock Package,
@@ -766,7 +766,7 @@ struct ExpectedPackageDependencies<'lock> {
     dependency_groups: BTreeMap<GroupName, BTreeSet<Requirement>>,
     source_requirements: &'lock DependencySources,
     activated_extras: BTreeSet<ExtraName>,
-    /// Environments where the workspace package itself can be selected.
+    /// Environments where the package itself can be selected.
     package_marker: UniversalMarker,
     /// The lockfile-wide environment used to simplify dependency markers.
     lock_marker: SimplifiedMarkerTree,
@@ -872,7 +872,7 @@ impl<'lock> ExpectedPackageDependencies<'lock> {
             MarkerTree::FALSE
         };
 
-        // A first-party declaration selects its direct source throughout the resolution.
+        // An authorized declaration selects its direct source throughout the resolution.
         // Preserve its full environment when the consumer overlaps only part of the source
         // marker; disjoint consumers may share the source but retain conflict predicates.
         if source_marker.is_false()
@@ -923,7 +923,7 @@ impl<'lock> ExpectedPackageDependencies<'lock> {
         Ok((!source_marker.is_false() && version_matches).then_some(source_marker))
     }
 
-    /// Include locked-only sections so removing an extra or group invalidates the lock.
+    /// Include recorded sections so removing their dependency edges invalidates the lock.
     fn contexts(&self) -> impl Iterator<Item = DependencyContext<'_>> + '_ {
         let is_workspace_package = self.lock.is_workspace_package(self.package);
         let extras = self
@@ -1497,10 +1497,10 @@ impl Lock {
         self
     }
 
-    /// Omit package metadata except for remote sources that cannot be refreshed offline.
+    /// Omit package metadata except for URL and Git dependencies.
     ///
-    /// Local declarations can be reread from disk. Remote URL and Git declarations must remain in
-    /// the lockfile so freshness checks can validate their dependencies without network access.
+    /// Local declarations can be reread from disk. URL and Git declarations remain in the lockfile
+    /// so freshness checks can validate their dependencies without fetching the source.
     pub fn without_package_metadata(
         mut self,
         resolution: &ResolverOutput,
@@ -3316,7 +3316,7 @@ impl Lock {
         Ok(SatisfiesResult::Satisfied)
     }
 
-    /// Return whether a live dependency context selects this exact source through a constraint.
+    /// Return whether an authorized direct source selects this package in the active context.
     fn constraint_selects_source(
         package: &Package,
         marker: MarkerTree,
@@ -3338,7 +3338,7 @@ impl Lock {
         Ok(false)
     }
 
-    /// Return whether an exact locked source is already reachable where the constraint applies.
+    /// Return whether an exact locked source is reachable where its declaration applies.
     fn source_is_reachable(
         &self,
         requirement: &Requirement,
@@ -3360,7 +3360,7 @@ impl Lock {
         Ok(false)
     }
 
-    /// Match a refreshed requirement without granting trust to a locked source by name alone.
+    /// Match a requirement's version and any explicitly declared source.
     fn package_satisfies_requirement(
         package: &Package,
         requirement: &Requirement,
@@ -3381,7 +3381,7 @@ impl Lock {
         Ok(source_matches && version_matches)
     }
 
-    /// Collect direct declarations only from reachable first-party dependency sections.
+    /// Collect direct declarations from reachable source-bearing packages.
     fn add_source_requirements(
         &self,
         package: &Package,
@@ -3466,7 +3466,7 @@ impl Lock {
         Ok(())
     }
 
-    /// Collect reachable local declarations without trusting removed locked dependency edges.
+    /// Collect reachable direct sources without trusting stale locked edges.
     async fn collect_dependency_sources<Context: BuildContext>(
         &self,
         mut source_requirements: BTreeSet<Requirement>,
@@ -3483,7 +3483,7 @@ impl Lock {
         database: &DistributionDatabase<'_, Context>,
         source_tree_metadata: &mut FxHashMap<PackageId, Option<SourceTreeRequiresDist>>,
     ) -> Result<DependencySources, LockError> {
-        // Global URL overrides are first-party sources and replace competing URL constraints.
+        // Global URL overrides authorize sources and replace competing URL constraints.
         // Scoped overrides cannot grant this privilege, and excluded packages stay inactive.
         let global_source_overrides = dependency_overrides
             .global_requirements()
@@ -3829,8 +3829,8 @@ impl Lock {
             }
         }
 
-        // Constraints may select an already-reachable source, but cannot introduce packages.
-        // Drop inactive entries before a deleted archive or stale local tree could be inspected.
+        // Constraints and global overrides may select reachable sources without adding packages.
+        // Drop inactive sources before inspecting a deleted archive or stale local tree.
         let mut pending_sources = Vec::<Requirement>::new();
         let mut inactive_constraints = Vec::new();
         for constraint in source_requirements
@@ -3867,9 +3867,9 @@ impl Lock {
         }
 
         // Inspect archives or invoke local backends only after an active declaration selects
-        // their exact reachable path. Remote and Git providers use only retained lock metadata.
+        // their exact reachable path. URL and Git providers use only retained lock metadata.
         // Registry packages stay out of this phase: their metadata cannot introduce direct
-        // sources or widen URLs already authorized by first-party declarations and constraints.
+        // sources or widen URLs authorized by first-party declarations, overrides, or constraints.
         let mut pending_packages = self
             .packages
             .iter()
