@@ -3449,6 +3449,7 @@ impl Lock {
         // reachability before deciding which declarations may authorize a direct source.
         let root_marker = self.fork_markers_union();
         let mut package_markers = FxHashMap::default();
+        let mut deferred_package_markers = FxHashMap::default();
         let mut package_queue = VecDeque::new();
         for package in &self.packages {
             if self.is_workspace_package(package) {
@@ -3477,8 +3478,8 @@ impl Lock {
             }
 
             // Refresh source trees only after their exact path becomes reachable. Archives
-            // remain opaque in this phase; their locked edges merely preserve reachability
-            // until an exact refreshed declaration permits metadata inspection below.
+            // and backend-only trees remain opaque until an exact refreshed declaration
+            // permits their metadata to be inspected in the second phase.
             let refreshed_source_tree =
                 if let Some(source_tree) = package.id.source.as_source_tree() {
                     Self::source_tree_requires_dist_cached(
@@ -3494,9 +3495,6 @@ impl Lock {
                 } else {
                     continue;
                 };
-            if package.id.source.is_source_tree() && refreshed_source_tree.is_none() {
-                continue;
-            }
             if refreshed_source_tree
                 .as_ref()
                 .and_then(|metadata| metadata.version.as_ref())
@@ -3633,14 +3631,6 @@ impl Lock {
                             };
                             marker.and(*requirement_marker)
                         } else {
-                            // Archive declarations are unavailable until their exact source
-                            // is authorized in phase two. An inherited edge cannot authorize
-                            // reading an external tree before those declarations are refreshed.
-                            if dependency_package.id.source.is_source_tree()
-                                && !self.is_workspace_package(dependency_package)
-                            {
-                                continue;
-                            }
                             marker
                         };
                         if marker.is_false() {
@@ -3666,14 +3656,32 @@ impl Lock {
                         } else {
                             marker
                         };
+                        if marker.is_false() {
+                            continue;
+                        }
+                        if refreshed_dependencies.is_none()
+                            && dependency_package.id.source.is_source_tree()
+                            && !self.is_workspace_package(dependency_package)
+                        {
+                            // Opaque archives and backends cannot authorize inspecting an
+                            // inherited local edge. Preserve its candidate contexts so a
+                            // refreshed, exact path may activate them in the second phase.
+                            deferred_package_markers
+                                .entry((&dependency_package.id, dependency_extra))
+                                .and_modify(|existing: &mut MarkerTree| {
+                                    *existing = existing.or(marker);
+                                })
+                                .or_insert(marker);
+                            continue;
+                        }
                         package_queue.push_back((dependency_package, dependency_extra, marker));
                     }
                 }
             }
         }
 
-        // Open an archive only after an active declaration selects its exact reachable path.
-        // HTTP leaves still need no artifact access, and source trees use static metadata.
+        // Inspect archives or invoke local backends only after an active declaration selects
+        // their exact reachable path. Static source trees still avoid backend execution.
         let mut source_requirements = BTreeSet::new();
         let mut pending_sources = Vec::<Requirement>::new();
         let mut pending_packages = self
@@ -3689,18 +3697,67 @@ impl Lock {
                     break;
                 };
                 for package in self.packages_for_name(&requirement.name) {
-                    if package_markers.contains_key(&(&package.id, None))
-                        && package
-                            .id
-                            .source
-                            .satisfies_requirement_source(&requirement.source, root)?
-                        && (package.id.source.is_source_tree()
+                    if !package
+                        .id
+                        .source
+                        .satisfies_requirement_source(&requirement.source, root)?
+                        || !(package.id.source.is_source_tree()
                             || matches!(package.id.source, Source::Path(..))
                             || matches!(package.id.source, Source::Direct(..))
                                 && package.all_dependencies().next().is_none())
                     {
-                        pending_packages.push(package);
+                        continue;
                     }
+
+                    let mut changed = false;
+                    if let Some(marker) = deferred_package_markers
+                        .get(&(&package.id, None))
+                        .map(|marker: &MarkerTree| marker.and(requirement.marker))
+                        .filter(|marker| !marker.is_false())
+                    {
+                        let existing = package_markers
+                            .entry((&package.id, None))
+                            .or_insert(MarkerTree::FALSE);
+                        let marker = existing.or(marker);
+                        if marker != *existing {
+                            *existing = marker;
+                            changed = true;
+                        }
+                    }
+                    if !package_markers
+                        .get(&(&package.id, None))
+                        .is_some_and(|marker| !marker.and(requirement.marker).is_false())
+                    {
+                        continue;
+                    }
+
+                    for extra in &requirement.extras {
+                        let Some((extra, _)) = package.optional_dependencies.get_key_value(extra)
+                        else {
+                            continue;
+                        };
+                        let Some(marker) = deferred_package_markers
+                            .get(&(&package.id, Some(extra)))
+                            .map(|marker| marker.and(requirement.marker))
+                            .filter(|marker| !marker.is_false())
+                        else {
+                            continue;
+                        };
+                        let existing = package_markers
+                            .entry((&package.id, Some(extra)))
+                            .or_insert(MarkerTree::FALSE);
+                        let marker = existing.or(marker);
+                        if marker != *existing {
+                            *existing = marker;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        // A later exact declaration can activate an extra after this
+                        // package's base requirements have already been inspected.
+                        visited_packages.remove(&package.id);
+                    }
+                    pending_packages.push(package);
                 }
                 continue;
             };
@@ -3708,40 +3765,39 @@ impl Lock {
             if !visited_packages.insert(&package.id) {
                 continue;
             }
-            let (direct_requirements, dependency_groups) =
-                if let Some(source_tree) = package.id.source.as_source_tree() {
-                    let Some(SourceTreeRequiresDist { metadata, .. }) =
-                        Self::source_tree_requires_dist_cached(
-                            source_tree,
-                            root,
-                            package,
-                            database,
-                            source_tree_metadata,
-                        )
-                        .await?
-                    else {
-                        // Backend-only and dynamic metadata are handled in a later stage.
-                        continue;
-                    };
-                    (metadata.requires_dist, metadata.dependency_groups)
-                } else if matches!(package.id.source, Source::Path(..)) {
-                    // `pending_sources` established exact source identity and reachability
-                    // before this archive was queued, so inspecting its metadata is now safe.
-                    let metadata = Self::package_metadata(
-                        package,
+            let (direct_requirements, dependency_groups) = if let Some(source_tree) =
+                package.id.source.as_source_tree()
+                && let Some(SourceTreeRequiresDist { metadata, .. }) =
+                    Self::source_tree_requires_dist_cached(
+                        source_tree,
                         root,
-                        tags,
-                        markers,
-                        build_options,
-                        hasher,
-                        index,
+                        package,
                         database,
+                        source_tree_metadata,
                     )
-                    .await?;
-                    (metadata.requires_dist, metadata.dependency_groups)
-                } else {
-                    continue;
-                };
+                    .await?
+            {
+                (metadata.requires_dist, metadata.dependency_groups)
+            } else if matches!(package.id.source, Source::Path(..))
+                || package.id.source.is_source_tree()
+            {
+                // `pending_sources` established exact source identity and reachability
+                // before an archive or backend-only local tree was queued.
+                let metadata = Self::package_metadata(
+                    package,
+                    root,
+                    tags,
+                    markers,
+                    build_options,
+                    hasher,
+                    index,
+                    database,
+                )
+                .await?;
+                (metadata.requires_dist, metadata.dependency_groups)
+            } else {
+                continue;
+            };
 
             self.add_source_requirements(
                 package,
