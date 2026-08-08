@@ -20,8 +20,8 @@ use url::Url;
 
 use uv_cache_key::RepositoryUrl;
 use uv_configuration::{
-    BuildOptions, Constraints, DependencyGroupsWithDefaults, ExcludeDependency,
-    ExtrasSpecificationWithDefaults, InstallTarget, Override, PackageOverride,
+    BuildOptions, Constraints, DependencyGroupsWithDefaults, ExcludeDependency, Excludes,
+    ExtrasSpecificationWithDefaults, InstallTarget, Override, Overrides, PackageOverride,
     ScopedOverrideSourceError,
 };
 use uv_distribution::{
@@ -1728,6 +1728,8 @@ impl Lock {
         requires_dist: Box<[Requirement]>,
         provides_extra: &[ExtraName],
         dependency_groups: BTreeMap<GroupName, Box<[Requirement]>>,
+        overrides: &Overrides,
+        excludes: &Excludes,
         package: &'lock Package,
         remotes: &mut Option<BTreeSet<UrlString>>,
         locals: &mut Option<BTreeSet<Box<Path>>>,
@@ -1738,6 +1740,8 @@ impl Lock {
             return Ok(self.satisfied_no_metadata(
                 package,
                 Some((&requires_dist, provides_extra, &dependency_groups)),
+                overrides,
+                excludes,
             ));
         }
 
@@ -1854,6 +1858,8 @@ impl Lock {
             &[ExtraName],
             &BTreeMap<GroupName, Box<[Requirement]>>,
         )>,
+        overrides: &Overrides,
+        excludes: &Excludes,
     ) -> SatisfiesResult<'lock> {
         let mismatch = |expected, actual| {
             SatisfiesResult::MismatchedPackageDependencies(
@@ -1870,8 +1876,6 @@ impl Lock {
         if !self.conflicts.is_empty()
             || !self.fork_markers.is_empty()
             || !self.manifest.constraints.is_empty()
-            || !self.manifest.overrides.is_empty()
-            || !self.manifest.excludes.is_empty()
             || self
                 .manifest
                 .dependency_groups
@@ -1886,6 +1890,34 @@ impl Lock {
         if !is_workspace_package {
             return mismatch(Vec::new(), &package.dependencies);
         }
+
+        let package_context = package
+            .id
+            .version
+            .as_ref()
+            .map(|version| (&package.id.name, version));
+        let requirements = overrides
+            .apply_for_package(package_context, requirements)
+            .filter(|requirement| {
+                !excludes.contains_for_package(package_context, &requirement.name)
+            })
+            .map(Cow::into_owned)
+            .collect::<Vec<_>>();
+        let dependency_groups = dependency_groups
+            .iter()
+            .map(|(group, requirements)| {
+                // Groups inherit global overrides but are not distribution dependencies, so
+                // overrides scoped to the owning package must not rewrite their requirements.
+                let requirements = overrides
+                    .apply_for_package(None, requirements)
+                    .filter(|requirement| {
+                        !excludes.contains_for_package(package_context, &requirement.name)
+                    })
+                    .map(Cow::into_owned)
+                    .collect::<Vec<_>>();
+                (group.clone(), requirements)
+            })
+            .collect::<BTreeMap<_, _>>();
 
         let parent_marker = UniversalMarker::from_combined(self.fork_markers_union());
         let environment =
@@ -1909,10 +1941,10 @@ impl Lock {
         for context in contexts {
             let actual = context.dependencies(package);
             let context_requirements: &[Requirement] = match context {
-                DependencyContext::Production | DependencyContext::Extra(_) => requirements,
+                DependencyContext::Production | DependencyContext::Extra(_) => &requirements,
                 DependencyContext::Group(group) => dependency_groups
                     .get(group)
-                    .map(Box::as_ref)
+                    .map(Vec::as_slice)
                     .unwrap_or_default(),
             };
             let mut expected = Vec::new();
@@ -2142,7 +2174,7 @@ impl Lock {
         }
 
         // Validate that the lockfile was generated with the same overrides.
-        {
+        let normalized_overrides = {
             let normalize = |entry: Override<Requirement>| -> Result<_, LockError> {
                 match entry {
                     Override::Requirement(requirement) => Ok(Override::Requirement(
@@ -2177,7 +2209,8 @@ impl Lock {
             if expected != actual {
                 return Ok(SatisfiesResult::MismatchedOverrides(expected, actual));
             }
-        }
+            expected
+        };
 
         // Validate that the lockfile was generated with the same excludes.
         {
@@ -2265,6 +2298,18 @@ impl Lock {
                 return Ok(SatisfiesResult::MismatchedStaticMetadata(expected, actual));
             }
         }
+
+        let dependency_overrides = if allow_missing_package_metadata {
+            Overrides::from_entries(normalized_overrides.into_iter().collect())
+                .map_err(LockErrorKind::InvalidScopedOverride)?
+        } else {
+            Overrides::default()
+        };
+        let dependency_excludes = if allow_missing_package_metadata {
+            Excludes::from_entries(excludes.iter().cloned())
+        } else {
+            Excludes::default()
+        };
 
         // Collect the set of available indexes (both `--index-url` and `--find-links` entries).
         let mut remotes = indexes.map(|locations| {
@@ -2416,7 +2461,12 @@ impl Lock {
                 && !package.has_metadata()
                 && matches!(package.id.source, Source::Direct(..))
             {
-                return Ok(self.satisfied_no_metadata(package, None));
+                return Ok(self.satisfied_no_metadata(
+                    package,
+                    None,
+                    &dependency_overrides,
+                    &dependency_excludes,
+                ));
             }
 
             // Validating a direct URL package requires retrieving metadata from the remote
@@ -2479,6 +2529,8 @@ impl Lock {
                             metadata.requires_dist,
                             &metadata.provides_extra,
                             metadata.dependency_groups,
+                            &dependency_overrides,
+                            &dependency_excludes,
                             package,
                             &mut remotes,
                             &mut locals,
@@ -2540,6 +2592,8 @@ impl Lock {
                         metadata.requires_dist,
                         &metadata.provides_extra,
                         metadata.dependency_groups,
+                        &dependency_overrides,
+                        &dependency_excludes,
                         package,
                         &mut remotes,
                         &mut locals,
@@ -2597,6 +2651,8 @@ impl Lock {
                         metadata.requires_dist,
                         &metadata.provides_extra,
                         metadata.dependency_groups,
+                        &dependency_overrides,
+                        &dependency_excludes,
                         package,
                         &mut remotes,
                         &mut locals,
@@ -2657,6 +2713,8 @@ impl Lock {
                         metadata.requires_dist,
                         &metadata.provides_extra,
                         metadata.dependency_groups,
+                        &dependency_overrides,
+                        &dependency_excludes,
                         package,
                         &mut remotes,
                         &mut locals,

@@ -17901,7 +17901,7 @@ fn lock_removed_empty_extra() -> Result<()> {
     Ok(())
 }
 
-/// Regenerate name-only production dependencies when package metadata is omitted.
+/// Regenerate registry dependencies and dependency policies when package metadata is omitted.
 #[cfg(feature = "test-universal")]
 #[test]
 fn lock_regenerates_dependencies_without_metadata() -> Result<()> {
@@ -17913,15 +17913,25 @@ fn lock_regenerates_dependencies_without_metadata() -> Result<()> {
         name = "project"
         version = "0.1.0"
         requires-python = ">=3.12"
-        dependencies = ["six>=1", "urllib3==1.0.0"]
+        dependencies = ["six>=2", "urllib3==1.0.0", "excluded", "scoped-excluded"]
 
         [project.optional-dependencies]
         empty = []
-        feature = ["six<2", "httpx[http2]>=1"]
+        feature = ["six<2", "httpx[http2]>=1", "excluded", "scoped-excluded"]
 
         [dependency-groups]
         empty = []
-        dev = ["six>=1", "httpx[http2]==1.0.0"]
+        dev = ["six>=2", "httpx[http2]==1.0.0", "excluded", "scoped-excluded"]
+
+        [tool.uv]
+        override-dependencies = [
+            "six>=0",
+            { package = { name = "project", version = "0.1.0" }, dependencies = ["six==1.0.0", "urllib3==1.0.0"] },
+        ]
+        exclude-dependencies = [
+            "excluded",
+            { package = { name = "project", version = "0.1.0" }, dependencies = ["scoped-excluded"] },
+        ]
         "#};
     pyproject_toml.write_str(original_pyproject)?;
 
@@ -17948,7 +17958,7 @@ fn lock_regenerates_dependencies_without_metadata() -> Result<()> {
     Resolved 5 packages in [TIME]
     ");
 
-    pyproject_toml.write_str(&original_pyproject.replace("six>=1", "six>=0"))?;
+    pyproject_toml.write_str(&original_pyproject.replace("six>=2", "six>=3"))?;
     uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--check").arg("--offline").arg("--no-cache").arg("--index-url").arg(server.index_url()), @"
     exit_code: 0 (success)
     ----- stderr -----
@@ -17964,9 +17974,10 @@ fn lock_regenerates_dependencies_without_metadata() -> Result<()> {
           And because your project requires project[empty], we can conclude that your project's requirements are unsatisfiable.
     ");
 
-    pyproject_toml.write_str(
-        &original_pyproject.replace("feature = [\"six<2\", \"httpx[http2]>=1\"]", "feature = []"),
-    )?;
+    pyproject_toml.write_str(&original_pyproject.replace(
+        "feature = [\"six<2\", \"httpx[http2]>=1\", \"excluded\", \"scoped-excluded\"]",
+        "feature = []",
+    ))?;
     uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--index-url").arg(server.index_url()), @"
     exit_code: 1 (failure)
     ----- stderr -----
@@ -17976,9 +17987,10 @@ fn lock_regenerates_dependencies_without_metadata() -> Result<()> {
     hint: To update the lockfile, run `uv lock`.
     ");
 
-    pyproject_toml.write_str(
-        &original_pyproject.replace("dev = [\"six>=1\", \"httpx[http2]==1.0.0\"]", "dev = []"),
-    )?;
+    pyproject_toml.write_str(&original_pyproject.replace(
+        "dev = [\"six>=2\", \"httpx[http2]==1.0.0\", \"excluded\", \"scoped-excluded\"]",
+        "dev = []",
+    ))?;
     uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--index-url").arg(server.index_url()), @"
     exit_code: 1 (failure)
     ----- stderr -----
