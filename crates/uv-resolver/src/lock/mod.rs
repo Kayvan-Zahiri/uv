@@ -3783,18 +3783,17 @@ impl Lock {
                         if marker.is_false() {
                             continue;
                         }
-                        let constrained_source = matches!(package.id.source, Source::Registry(..))
-                            && !matches!(dependency_package.id.source, Source::Registry(..))
+                        let registry_external_source =
+                            matches!(package.id.source, Source::Registry(..))
+                                && !matches!(dependency_package.id.source, Source::Registry(..));
+                        let constrained_source = registry_external_source
                             && Self::constraint_selects_source(
                                 dependency_package,
                                 marker,
                                 &source_requirements,
                                 root,
                             )?;
-                        if matches!(package.id.source, Source::Registry(..))
-                            && !matches!(dependency_package.id.source, Source::Registry(..))
-                            && !constrained_source
-                        {
+                        if registry_external_source && !constrained_source {
                             continue;
                         }
                         if refreshed_dependencies.is_none()
