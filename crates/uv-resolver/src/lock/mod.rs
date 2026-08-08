@@ -3471,6 +3471,26 @@ impl Lock {
         database: &DistributionDatabase<'_, Context>,
         source_tree_metadata: &mut FxHashMap<PackageId, Option<SourceTreeRequiresDist>>,
     ) -> Result<DependencySources, LockError> {
+        // Global URL overrides are first-party sources and replace competing URL constraints.
+        // Scoped overrides cannot grant this privilege, and excluded packages stay inactive.
+        let global_source_overrides = dependency_overrides
+            .global_requirements()
+            .filter(|requirement| {
+                !matches!(requirement.source, RequirementSource::Registry { .. })
+                    && !dependency_excludes.contains(&requirement.name)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !global_source_overrides.is_empty() {
+            source_requirements.retain(|requirement| {
+                matches!(requirement.source, RequirementSource::Registry { .. })
+                    || global_source_overrides
+                        .iter()
+                        .all(|override_requirement| override_requirement.name != requirement.name)
+            });
+            source_requirements.extend(global_source_overrides);
+        }
+
         // Locked edge markers are parent-relative. Compute standalone package and extra
         // reachability before deciding which declarations may authorize a direct source.
         let root_marker = self.fork_markers_union();
