@@ -2500,16 +2500,6 @@ impl Lock {
                 actual,
             )
         };
-        if missing_metadata
-            && self
-                .manifest
-                .dependency_groups
-                .values()
-                .any(|requirements| !requirements.is_empty())
-        {
-            return Ok(mismatch(Vec::new(), &package.dependencies));
-        }
-
         for context in expected.contexts() {
             if let DependencyContext::Extra(extra) = context
                 && !expected.provides_extra.contains(extra)
@@ -2820,9 +2810,23 @@ impl Lock {
         } else {
             Excludes::default()
         };
+        // Projectless workspace groups and scripts are root declarations, so apply only
+        // global overrides and exclusions before using them for sources or validation.
+        let root_requirements = dependency_overrides
+            .apply_for_package(
+                None,
+                requirements
+                    .iter()
+                    .chain(dependency_groups.values().flatten()),
+            )
+            .filter(|requirement| {
+                !dependency_excludes.contains_for_package(None, &requirement.name)
+            })
+            .collect::<Vec<_>>();
         let dependency_sources = if allow_missing_package_metadata {
             Box::pin(self.collect_dependency_sources(
                 normalized_constraints,
+                &root_requirements,
                 dependency_metadata,
                 &dependency_overrides,
                 &dependency_excludes,
@@ -2889,11 +2893,6 @@ impl Lock {
 
         // Add requirements attached directly to the target root (e.g., PEP 723 requirements or
         // dependency groups in workspaces without a `[project]` table).
-        let root_requirements = requirements
-            .iter()
-            .chain(dependency_groups.values().flatten())
-            .collect::<Vec<_>>();
-
         for requirement in &root_requirements {
             if let RequirementSource::Registry {
                 index: Some(index), ..
@@ -2921,7 +2920,19 @@ impl Lock {
 
             for requirement in root_requirements {
                 for package in by_name.get(&requirement.name).into_iter().flatten() {
-                    if !package.id.source.is_source_tree() {
+                    if !package.id.source.is_source_tree()
+                        || allow_missing_package_metadata
+                            && (!Self::package_satisfies_requirement(package, &requirement, root)?
+                                || matches!(
+                                    requirement.source,
+                                    RequirementSource::Registry { index: None, .. }
+                                ) && !dependency_sources
+                                    .package_markers
+                                    .get(&package.id)
+                                    .is_some_and(|marker| {
+                                        !marker.and(requirement.marker).is_false()
+                                    }))
+                    {
                         continue;
                     }
 
@@ -3459,6 +3470,7 @@ impl Lock {
     async fn collect_dependency_sources<Context: BuildContext>(
         &self,
         mut source_requirements: BTreeSet<Requirement>,
+        root_requirements: &[Cow<'_, Requirement>],
         dependency_metadata: &DependencyMetadata,
         dependency_overrides: &Overrides,
         dependency_excludes: &Excludes,
@@ -3506,6 +3518,42 @@ impl Lock {
                             .conflict_marker(&package.id.name, &self.conflicts),
                     );
                     package_queue.push_back((package, Some(extra), marker));
+                }
+            }
+        }
+        for requirement in root_requirements {
+            for package in self.packages_for_name(&requirement.name) {
+                if !Self::package_satisfies_requirement(package, requirement, root)? {
+                    continue;
+                }
+                let Some(marker) = self.root_requirement_marker(requirement, package) else {
+                    continue;
+                };
+                let marker = root_marker.and(marker);
+                if matches!(
+                    requirement.source,
+                    RequirementSource::Registry { index: None, .. }
+                ) && !matches!(package.id.source, Source::Registry(..))
+                    && !Self::constraint_selects_source(
+                        package,
+                        marker,
+                        &source_requirements,
+                        root,
+                    )?
+                {
+                    // A bare root name cannot revive an old direct source. Current workspace
+                    // declarations, active constraints, and global overrides authorize it.
+                    continue;
+                }
+                package_queue.push_back((package, None, marker));
+                for extra in &requirement.extras {
+                    if let Some((extra, _)) = package.optional_dependencies.get_key_value(extra) {
+                        let marker = marker.and(
+                            DependencyContext::Extra(extra)
+                                .conflict_marker(&package.id.name, &self.conflicts),
+                        );
+                        package_queue.push_back((package, Some(extra), marker));
+                    }
                 }
             }
         }
@@ -3797,6 +3845,25 @@ impl Lock {
         }
         for constraint in inactive_constraints {
             source_requirements.remove(&constraint);
+        }
+
+        // Root declarations can select a source only after its exact package is reachable;
+        // retain its platform context for that check before sharing it across the graph.
+        for requirement in root_requirements {
+            if matches!(requirement.source, RequirementSource::Registry { .. }) {
+                continue;
+            }
+            let mut requirement = normalize_requirement(
+                requirement.clone().into_owned(),
+                root,
+                &self.requires_python,
+            )?;
+            if !self.source_is_reachable(&requirement, &package_markers, root)? {
+                continue;
+            }
+            requirement.marker = requirement.marker.only_extras();
+            pending_sources.push(requirement.clone());
+            source_requirements.insert(requirement);
         }
 
         // Inspect archives or invoke local backends only after an active declaration selects
