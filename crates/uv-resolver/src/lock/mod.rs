@@ -3697,16 +3697,6 @@ impl Lock {
                                         &source_requirements,
                                         root,
                                     )?
-                                || !matches!(
-                                    dependency.id.source,
-                                    Source::Registry(..)
-                                        | Source::Direct(..)
-                                        | Source::Git(..)
-                                        | Source::Path(..)
-                                        | Source::Directory(..)
-                                        | Source::Editable(..)
-                                        | Source::Virtual(..)
-                                )
                             {
                                 continue;
                             }
@@ -3887,11 +3877,6 @@ impl Lock {
                         .id
                         .source
                         .satisfies_requirement_source(&requirement.source, root)?
-                        || !(package.id.source.is_source_tree()
-                            || matches!(
-                                package.id.source,
-                                Source::Path(..) | Source::Direct(..) | Source::Git(..)
-                            ))
                     {
                         continue;
                     }
