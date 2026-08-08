@@ -17786,6 +17786,44 @@ fn lock_writes_without_package_metadata() -> Result<()> {
     Ok(())
 }
 
+/// An empty extra remains selectable when its lockfile omits package metadata.
+#[cfg(feature = "test-universal")]
+#[test]
+fn lock_metadata_free_frozen_empty_extra() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+
+        [project.optional-dependencies]
+        empty = []
+        "#})?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    ");
+
+    uv_snapshot!(context.filters(), context.sync()
+        .arg("--preview-features")
+        .arg("lock-without-metadata")
+        .arg("--frozen")
+        .arg("--extra")
+        .arg("empty"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Checked in [TIME]
+    ");
+
+    Ok(())
+}
+
 /// Removing an empty extra invalidates the lockfile that recorded it.
 #[cfg(feature = "test-universal")]
 #[test]
@@ -17876,13 +17914,21 @@ fn lock_regenerates_dependencies_without_metadata() -> Result<()> {
         version = "0.1.0"
         requires-python = ">=3.12"
         dependencies = ["six", "urllib3"]
+
+        [project.optional-dependencies]
+        empty = []
+        feature = ["six", "httpx[http2]"]
+
+        [dependency-groups]
+        empty = []
+        dev = ["six", "httpx[http2]"]
         "#};
     pyproject_toml.write_str(original_pyproject)?;
 
     uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--index-url").arg(server.index_url()), @"
     exit_code: 0 (success)
     ----- stderr -----
-    Resolved 3 packages in [TIME]
+    Resolved 5 packages in [TIME]
     ");
 
     let lock = context.read("uv.lock").parse::<toml_edit::DocumentMut>()?;
@@ -17899,12 +17945,39 @@ fn lock_regenerates_dependencies_without_metadata() -> Result<()> {
     uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--check").arg("--offline").arg("--no-cache").arg("--index-url").arg(server.index_url()), @"
     exit_code: 0 (success)
     ----- stderr -----
-    Resolved 3 packages in [TIME]
+    Resolved 5 packages in [TIME]
     ");
 
     pyproject_toml.write_str(
-        &original_pyproject.replace("dependencies = [\"six\", \"urllib3\"]", "dependencies = []"),
+        &original_pyproject.replace("feature = [\"six\", \"httpx[http2]\"]", "feature = []"),
     )?;
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--index-url").arg(server.index_url()), @"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    Resolved 5 packages in [TIME]
+    error: The lockfile at `uv.lock` needs to be updated, but `--locked` was provided.
+
+    hint: To update the lockfile, run `uv lock`.
+    ");
+
+    pyproject_toml
+        .write_str(&original_pyproject.replace("dev = [\"six\", \"httpx[http2]\"]", "dev = []"))?;
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--index-url").arg(server.index_url()), @"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    Resolved 5 packages in [TIME]
+    error: The lockfile at `uv.lock` needs to be updated, but `--locked` was provided.
+
+    hint: To update the lockfile, run `uv lock`.
+    ");
+
+    pyproject_toml.write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = []
+        "#})?;
     uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--check").arg("--offline").arg("--no-cache").arg("--index-url").arg(server.index_url()), @"
     exit_code: 1 (failure)
     ----- stderr -----
