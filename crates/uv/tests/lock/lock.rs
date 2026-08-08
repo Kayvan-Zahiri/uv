@@ -17801,7 +17801,7 @@ fn lock_writes_without_package_metadata() -> Result<()> {
         name = "project"
         version = "0.1.0"
         requires-python = ">=3.12"
-        dependencies = ["httpx[http2] @ {httpx_url}"]
+        dependencies = ["httpx @ {httpx_url}"]
         "#,
             httpx_url = server.file_url("httpx-1.0.0-py3-none-any.whl"),
         })?;
@@ -17809,8 +17809,7 @@ fn lock_writes_without_package_metadata() -> Result<()> {
     uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--index-url").arg(server.index_url()), @"
     exit_code: 0 (success)
     ----- stderr -----
-    Resolved 3 packages in [TIME]
-    Added h2 v1.0.0
+    Resolved 2 packages in [TIME]
     Added httpx v1.0.0
     ");
 
@@ -17825,6 +17824,12 @@ fn lock_writes_without_package_metadata() -> Result<()> {
     assert!(packages.iter().all(|package| {
         package["name"].as_str() == Some("httpx") || package.get("metadata").is_none()
     }));
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--check").arg("--offline").arg("--no-cache").arg("--index-url").arg(server.index_url()), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    ");
 
     Ok(())
 }
