@@ -3911,9 +3911,9 @@ impl Lock {
                             changed = true;
                         }
                     }
-                    if !package_markers
+                    if package_markers
                         .get(&(&package.id, None))
-                        .is_some_and(|marker| !marker.and(requirement.marker).is_false())
+                        .is_none_or(|marker| marker.and(requirement.marker).is_false())
                     {
                         continue;
                     }
