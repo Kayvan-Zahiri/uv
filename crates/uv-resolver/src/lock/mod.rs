@@ -561,6 +561,7 @@ impl<'a> LockedDependencyBuilder<'a> {
         dependencies: &mut Vec<Dependency>,
         expected: &ExpectedPackageDependencies<'_>,
         context: DependencyContext<'_>,
+        activated_extras: &mut FxHashMap<PackageId, BTreeSet<ExtraName>>,
     ) -> Result<bool, LockError> {
         let empty_requirements = BTreeSet::new();
         let requirements = match context {
@@ -575,6 +576,17 @@ impl<'a> LockedDependencyBuilder<'a> {
         let mut complete = true;
 
         for requirement in requirements {
+            let requirement_marker = context.requirement_marker(requirement.marker);
+            let mut required_marker = UniversalMarker::from_combined(requirement_marker);
+            required_marker.and(self.parent_marker);
+            if let Some(conflict_marker) =
+                expected.requirement_conflict_marker(context, requirement)
+            {
+                required_marker.and(conflict_marker);
+            }
+            if required_marker.is_false() {
+                continue;
+            }
             match &requirement.source {
                 RequirementSource::Registry { index: None, .. }
                 | RequirementSource::Url { .. }
@@ -586,18 +598,6 @@ impl<'a> LockedDependencyBuilder<'a> {
                     complete = false;
                     continue;
                 }
-            }
-
-            let requirement_marker = context.requirement_marker(requirement.marker);
-            let mut required_marker = UniversalMarker::from_combined(requirement_marker);
-            required_marker.and(self.parent_marker);
-            if let Some(conflict_marker) =
-                expected.requirement_conflict_marker(context, requirement)
-            {
-                required_marker.and(conflict_marker);
-            }
-            if required_marker.is_false() {
-                continue;
             }
             let requirement_environment =
                 SimplifiedMarkerTree::new(self.requires_python, required_marker.pep508())
@@ -632,11 +632,6 @@ impl<'a> LockedDependencyBuilder<'a> {
                 else {
                     continue;
                 };
-                if dependency.id.source.is_source_tree()
-                    && !expected.lock.is_workspace_package(dependency)
-                {
-                    continue;
-                }
                 if matches!(dependency.id.source, Source::Direct(..))
                     && dependency.all_dependencies().next().is_some()
                 {
@@ -682,6 +677,11 @@ impl<'a> LockedDependencyBuilder<'a> {
                     continue;
                 }
                 covered_marker = covered_marker.or(marker.combined());
+
+                activated_extras
+                    .entry(dependency.id.clone())
+                    .or_default()
+                    .extend(requirement.extras.iter().cloned());
 
                 let extras = requirement
                     .extras
@@ -783,6 +783,7 @@ struct ExpectedPackageDependencies<'lock> {
     provides_extra: &'lock [ExtraName],
     dependency_groups: BTreeMap<GroupName, BTreeSet<Requirement>>,
     source_requirements: &'lock DependencySources,
+    activated_extras: BTreeSet<ExtraName>,
     /// Environments where the workspace package itself can be selected.
     package_marker: UniversalMarker,
     /// The lockfile-wide environment used to simplify dependency markers.
@@ -794,14 +795,15 @@ struct ExpectedPackageDependencies<'lock> {
 impl<'lock> ExpectedPackageDependencies<'lock> {
     fn new(
         lock: &'lock Lock,
-        declarations: &[Requirement],
+        declarations: &BTreeSet<Requirement>,
         provides_extra: &'lock [ExtraName],
-        dependency_groups: &BTreeMap<GroupName, Box<[Requirement]>>,
+        dependency_groups: &BTreeMap<GroupName, BTreeSet<Requirement>>,
         source_requirements: &'lock DependencySources,
         overrides: &Overrides,
         excludes: &Excludes,
         package_requires_python: Option<&VersionSpecifiers>,
         package: &'lock Package,
+        activated_extras: BTreeSet<ExtraName>,
         workspace_root: &'lock Path,
     ) -> Self {
         let package_context = package
@@ -861,6 +863,7 @@ impl<'lock> ExpectedPackageDependencies<'lock> {
             provides_extra,
             dependency_groups,
             source_requirements,
+            activated_extras,
             package_marker,
             lock_marker: SimplifiedMarkerTree::new(
                 &lock.requires_python,
@@ -940,14 +943,17 @@ impl<'lock> ExpectedPackageDependencies<'lock> {
 
     /// Include locked-only sections so removing an extra or group invalidates the lock.
     fn contexts(&self) -> impl Iterator<Item = DependencyContext<'_>> + '_ {
+        let is_workspace_package = self.lock.is_workspace_package(self.package);
         let extras = self
             .provides_extra
             .iter()
+            .filter(|extra| is_workspace_package || self.activated_extras.contains(*extra))
             .chain(self.package.optional_dependencies.keys())
             .collect::<BTreeSet<_>>();
         let groups = self
             .dependency_groups
             .keys()
+            .filter(|_| is_workspace_package)
             .chain(self.package.dependency_groups.keys())
             .collect::<BTreeSet<_>>();
 
@@ -2354,23 +2360,13 @@ impl Lock {
         excludes: &Excludes,
         package_requires_python: Option<&VersionSpecifiers>,
         package: &'lock Package,
+        activated_extras: &mut FxHashMap<PackageId, BTreeSet<ExtraName>>,
         remotes: &mut Option<BTreeSet<UrlString>>,
         locals: &mut Option<BTreeSet<Box<Path>>>,
         root: &Path,
         allow_missing_package_metadata: bool,
     ) -> Result<SatisfiesResult<'lock>, LockError> {
-        if allow_missing_package_metadata && !package.has_metadata() {
-            return self.satisfied_no_metadata(
-                package,
-                Some((&requires_dist, provides_extra, &dependency_groups)),
-                source_requirements,
-                overrides,
-                excludes,
-                package_requires_python,
-                root,
-            );
-        }
-
+        let missing_metadata = allow_missing_package_metadata && !package.has_metadata();
         let indexes = requires_dist
             .iter()
             .chain(dependency_groups.values().flatten())
@@ -2383,7 +2379,7 @@ impl Lock {
             .collect::<Vec<_>>();
 
         // Special-case: if the version is dynamic, compare the flattened requirements.
-        let flattened = if package.is_dynamic() {
+        let flattened = if package.is_dynamic() || missing_metadata {
             Some(
                 FlatRequiresDist::from_requirements(requires_dist.clone(), &package.id.name)
                     .into_iter()
@@ -2408,7 +2404,8 @@ impl Lock {
             .map(|requirement| normalize_requirement(requirement, root, &self.requires_python))
             .collect::<Result<_, _>>()?;
 
-        if expected_requirements != actual
+        if !missing_metadata
+            && expected_requirements != actual
             && flattened
                 .as_ref()
                 .is_none_or(|expected| expected != &actual)
@@ -2455,13 +2452,43 @@ impl Lock {
             })
             .collect::<Result<_, _>>()?;
 
-        if expected_groups != actual {
+        if !missing_metadata && expected_groups != actual {
             return Ok(SatisfiesResult::MismatchedPackageDependencyGroups(
                 &package.id.name,
                 package.id.version.as_ref(),
                 expected_groups,
                 actual,
             ));
+        }
+
+        if allow_missing_package_metadata {
+            let declarations = flattened.as_ref().unwrap_or(&expected_requirements);
+            let package_activated_extras = activated_extras
+                .get(&package.id)
+                .cloned()
+                .unwrap_or_default();
+            let expected = ExpectedPackageDependencies::new(
+                self,
+                declarations,
+                provides_extra,
+                &expected_groups,
+                source_requirements,
+                overrides,
+                excludes,
+                package_requires_python,
+                package,
+                package_activated_extras,
+                root,
+            );
+            match self.satisfied_no_metadata(
+                package,
+                activated_extras,
+                missing_metadata,
+                &expected,
+            )? {
+                SatisfiesResult::Satisfied => {}
+                dissatisfied => return Ok(dissatisfied),
+            }
         }
 
         // Add any explicit indexes to the list of known locals or remotes. These indexes may
@@ -2479,16 +2506,9 @@ impl Lock {
     fn satisfied_no_metadata<'lock>(
         &self,
         package: &'lock Package,
-        declarations: Option<(
-            &[Requirement],
-            &[ExtraName],
-            &BTreeMap<GroupName, Box<[Requirement]>>,
-        )>,
-        source_requirements: &DependencySources,
-        overrides: &Overrides,
-        excludes: &Excludes,
-        package_requires_python: Option<&VersionSpecifiers>,
-        workspace_root: &Path,
+        activated_extras: &mut FxHashMap<PackageId, BTreeSet<ExtraName>>,
+        missing_metadata: bool,
+        expected: &ExpectedPackageDependencies<'_>,
     ) -> Result<SatisfiesResult<'lock>, LockError> {
         let mismatch = |expected, actual| {
             SatisfiesResult::MismatchedPackageDependencies(
@@ -2498,38 +2518,27 @@ impl Lock {
                 actual,
             )
         };
-        let Some((requirements, provides_extra, dependency_groups)) = declarations else {
-            return Ok(mismatch(Vec::new(), &package.dependencies));
-        };
-
-        if !self.manifest.constraints.is_empty()
-            || self
-                .manifest
-                .dependency_groups
-                .values()
-                .any(|requirements| !requirements.is_empty())
+        if missing_metadata
+            && (!self.manifest.constraints.is_empty()
+                || self
+                    .manifest
+                    .dependency_groups
+                    .values()
+                    .any(|requirements| !requirements.is_empty()))
         {
             return Ok(mismatch(Vec::new(), &package.dependencies));
         }
 
-        if !self.is_workspace_package(package) {
-            return Ok(mismatch(Vec::new(), &package.dependencies));
-        }
-
-        let expected = ExpectedPackageDependencies::new(
-            self,
-            requirements,
-            provides_extra,
-            dependency_groups,
-            source_requirements,
-            overrides,
-            excludes,
-            package_requires_python,
-            package,
-            workspace_root,
-        );
-
         for context in expected.contexts() {
+            if let DependencyContext::Extra(extra) = context
+                && !expected.provides_extra.contains(extra)
+            {
+                if missing_metadata {
+                    return Ok(mismatch(Vec::new(), context.dependencies(package)));
+                }
+                continue;
+            }
+
             let parent_marker = expected.context_parent_marker(context);
             let mut generated = Vec::new();
             let builder = LockedDependencyBuilder::new(
@@ -2537,8 +2546,12 @@ impl Lock {
                 expected.lock_marker,
                 parent_marker,
             );
-            let complete = builder.add_requirements(&mut generated, &expected, context)?;
+            let complete =
+                builder.add_requirements(&mut generated, expected, context, activated_extras)?;
             generated.sort();
+            if !missing_metadata {
+                continue;
+            }
             let actual = context.dependencies(package);
             if !complete || !expected.dependencies_match(&generated, actual, parent_marker, context)
             {
@@ -2601,6 +2614,8 @@ impl Lock {
             allow_missing_package_metadata && self.supports_missing_package_metadata();
         let mut queue: VecDeque<&Package> = VecDeque::new();
         let mut seen = FxHashSet::default();
+        let mut activated_extras: FxHashMap<PackageId, BTreeSet<ExtraName>> = FxHashMap::default();
+        let mut validated_extras: FxHashMap<PackageId, BTreeSet<ExtraName>> = FxHashMap::default();
 
         // Validate that the lockfile was generated with the same root members.
         {
@@ -2938,6 +2953,11 @@ impl Lock {
                         continue;
                     }
 
+                    activated_extras
+                        .entry(package.id.clone())
+                        .or_default()
+                        .extend(requirement.extras.iter().cloned());
+
                     if seen.insert(&package.id) {
                         queue.push_back(package);
                     }
@@ -3065,6 +3085,7 @@ impl Lock {
                             &dependency_excludes,
                             requires_python.as_ref(),
                             package,
+                            &mut activated_extras,
                             &mut remotes,
                             &mut locals,
                             root,
@@ -3130,6 +3151,7 @@ impl Lock {
                         &dependency_excludes,
                         metadata.requires_python.as_ref(),
                         package,
+                        &mut activated_extras,
                         &mut remotes,
                         &mut locals,
                         root,
@@ -3191,6 +3213,7 @@ impl Lock {
                         &dependency_excludes,
                         requires_python.as_ref(),
                         package,
+                        &mut activated_extras,
                         &mut remotes,
                         &mut locals,
                         root,
@@ -3255,6 +3278,7 @@ impl Lock {
                         &dependency_excludes,
                         metadata.requires_python.as_ref(),
                         package,
+                        &mut activated_extras,
                         &mut remotes,
                         &mut locals,
                         root,
@@ -3268,8 +3292,21 @@ impl Lock {
                 return Ok(SatisfiesResult::MissingVersion(&package.id.name));
             }
 
+            // An empty extra has no edge of its own, so revisit packages when a later
+            // parent activates additional extras after their first validation.
+            validated_extras.insert(
+                package.id.clone(),
+                activated_extras
+                    .get(&package.id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
             for dependency in package.all_dependencies() {
-                if seen.insert(&dependency.package_id) {
+                let needs_extra_validation = validated_extras
+                    .get(&dependency.package_id)
+                    .zip(activated_extras.get(&dependency.package_id))
+                    .is_some_and(|(validated, activated)| !activated.is_subset(validated));
+                if seen.insert(&dependency.package_id) || needs_extra_validation {
                     let dependency_package = self.find_by_id(&dependency.package_id);
                     queue.push_back(dependency_package);
                 }
@@ -3368,8 +3405,8 @@ impl Lock {
                 requirement_marker
             };
 
-            // This phase may discover only HTTP leaves and first-party workspace trees.
-            // Archives, Git, and non-workspace providers require separate trust checks.
+            // This phase may discover only HTTP leaves and exact local source trees.
+            // Archives, Git, and remote providers require separate trust checks.
             if requirement_marker.is_false()
                 || !matches!(
                     requirement.source,
@@ -3389,7 +3426,7 @@ impl Lock {
         Ok(())
     }
 
-    /// Collect first-party direct sources without trusting removed locked dependency edges.
+    /// Collect reachable local declarations without trusting removed locked dependency edges.
     async fn collect_dependency_sources<Context: BuildContext>(
         &self,
         dependency_overrides: &Overrides,
@@ -3429,11 +3466,8 @@ impl Lock {
                 package_queue.push_back((package, None, marker));
             }
 
-            // No inherited registry, HTTP, archive, Git, or outside-workspace edge can
-            // authorize another source. Only refreshed first-party declarations are trusted.
-            if !self.is_workspace_package(package) {
-                continue;
-            }
+            // A local source tree is inspected only after a refreshed parent declaration
+            // selected its exact locked path; registry and remote nodes stop traversal.
             let Some(source_tree) = package.id.source.as_source_tree() else {
                 continue;
             };
@@ -3474,7 +3508,11 @@ impl Lock {
                 metadata
                     .dependency_groups
                     .into_iter()
-                    .filter(|_| extra.is_none())
+                    .filter(|(group, _)| {
+                        extra.is_none()
+                            && (self.is_workspace_package(package)
+                                || package.dependency_groups.contains_key(group))
+                    })
                     .map(|(group, requirements)| {
                         (Some(group), <[Requirement]>::into_vec(requirements))
                     }),
@@ -3499,8 +3537,14 @@ impl Lock {
                         requirement_context.requirement_marker(requirement.marker);
                     for dependency in self.packages_for_name(&requirement.name) {
                         if !Self::package_satisfies_requirement(dependency, &requirement, root)?
+                            // A bare registry declaration cannot authorize reading a stale
+                            // external tree merely because an inherited lock edge points there.
                             || dependency.id.source.is_source_tree()
                                 && !self.is_workspace_package(dependency)
+                                && !dependency
+                                    .id
+                                    .source
+                                    .satisfies_requirement_source(&requirement.source, root)?
                             || !matches!(
                                 dependency.id.source,
                                 Source::Registry(..)
@@ -3584,8 +3628,8 @@ impl Lock {
             }
         }
 
-        // Resolve direct-source provenance only from reachable, refreshed workspace
-        // declarations. Matching HTTP leaves need no artifact, archive, or backend access.
+        // Refresh declarations only after an exact source selection proves a local tree
+        // reachable. Matching HTTP leaves need no artifact, archive, or backend access.
         let mut source_requirements = BTreeSet::new();
         let mut pending_sources = Vec::<Requirement>::new();
         let mut pending_packages = self
@@ -3606,7 +3650,7 @@ impl Lock {
                             .id
                             .source
                             .satisfies_requirement_source(&requirement.source, root)?
-                        && (self.is_workspace_package(package)
+                        && (package.id.source.is_source_tree()
                             || matches!(package.id.source, Source::Direct(..))
                                 && package.all_dependencies().next().is_none())
                     {
@@ -3616,7 +3660,7 @@ impl Lock {
                 continue;
             };
 
-            if !visited_packages.insert(&package.id) || !self.is_workspace_package(package) {
+            if !visited_packages.insert(&package.id) {
                 continue;
             }
             let Some(source_tree) = package.id.source.as_source_tree() else {
@@ -3646,7 +3690,12 @@ impl Lock {
                 &mut source_requirements,
                 &mut pending_sources,
             )?;
-            for (group, requirements) in metadata.dependency_groups {
+            for (group, requirements) in
+                metadata.dependency_groups.into_iter().filter(|(group, _)| {
+                    self.is_workspace_package(package)
+                        || package.dependency_groups.contains_key(group)
+                })
+            {
                 self.add_source_requirements(
                     package,
                     requirements.into_vec(),

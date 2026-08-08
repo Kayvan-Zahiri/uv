@@ -18171,6 +18171,174 @@ fn lock_regenerates_incompatible_self_requirement() -> Result<()> {
     Ok(())
 }
 
+/// An activated empty extra must be refreshed if it gains dependencies.
+#[cfg(feature = "test-universal")]
+#[test]
+fn lock_regenerates_activated_empty_extra() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["dependency", "z-activator"]
+
+        [tool.uv.sources]
+        dependency = { path = "dependency" }
+        z-activator = { path = "activator" }
+        "#})?;
+
+    let activator = context.temp_dir.child("activator");
+    activator.create_dir_all()?;
+    activator.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "z-activator"
+        version = "1.0.0"
+        requires-python = ">=3.12"
+        dependencies = ["dependency[feature]"]
+
+        [tool.uv.sources]
+        dependency = { path = "../dependency" }
+        "#})?;
+
+    let dependency = context.temp_dir.child("dependency");
+    dependency.create_dir_all()?;
+    let dependency_pyproject_toml = dependency.child("pyproject.toml");
+    dependency_pyproject_toml.write_str(indoc! {r#"
+        [project]
+        name = "dependency"
+        version = "1.0.0"
+        requires-python = ">=3.12"
+
+        [project.optional-dependencies]
+        feature = []
+        "#})?;
+
+    let leaf = context.temp_dir.child("leaf");
+    leaf.create_dir_all()?;
+    leaf.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "leaf"
+        version = "1.0.0"
+        requires-python = ">=3.12"
+        "#})?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    ");
+
+    let mut lock = context.read("uv.lock").parse::<toml_edit::DocumentMut>()?;
+    let Some(packages) = lock["package"].as_array_of_tables_mut() else {
+        anyhow::bail!("lockfile did not contain a package array");
+    };
+    let Some(dependency) = packages
+        .iter_mut()
+        .find(|package| package["name"].as_str() == Some("dependency"))
+    else {
+        anyhow::bail!("lockfile did not contain the dependency package");
+    };
+    dependency.remove("metadata");
+    lock["revision"] = toml_edit::value(4);
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    dependency_pyproject_toml.write_str(indoc! {r#"
+        [project]
+        name = "dependency"
+        version = "1.0.0"
+        requires-python = ">=3.12"
+
+        [project.optional-dependencies]
+        feature = ["leaf"]
+
+        [tool.uv.sources]
+        leaf = { path = "../leaf" }
+        "#})?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--locked").arg("--offline"), @"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    Resolved 4 packages in [TIME]
+    error: The lockfile at `uv.lock` needs to be updated, but `--locked` was provided.
+
+    hint: To update the lockfile, run `uv lock`.
+    ");
+
+    Ok(())
+}
+
+/// Refreshing an extra on a local dependency must respect marker-specific activation.
+#[cfg(feature = "test-universal")]
+#[test]
+fn lock_regenerates_marker_specific_local_extra() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = [
+            "dependency[feature] ; sys_platform == 'win32'",
+            "dependency ; sys_platform != 'win32'",
+        ]
+
+        [tool.uv.sources]
+        dependency = { path = "dependency" }
+        "#})?;
+    context
+        .temp_dir
+        .child("dependency/pyproject.toml")
+        .write_str(indoc! {r#"
+            [project]
+            name = "dependency"
+            version = "1.0.0"
+            requires-python = ">=3.12"
+
+            [project.optional-dependencies]
+            feature = ["leaf"]
+
+            [tool.uv.sources]
+            leaf = { path = "../leaf" }
+            "#})?;
+    context
+        .temp_dir
+        .child("leaf/pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "leaf"
+        version = "1.0.0"
+        requires-python = ">=3.12"
+        "#})?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--offline"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    ");
+
+    let lock = lock_without_package_metadata(&context.read("uv.lock"))?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("lock-without-metadata").arg("--check").arg("--offline").arg("--no-cache"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    ");
+
+    Ok(())
+}
+
 /// First-party direct sources apply globally, even across disjoint platform markers.
 #[cfg(feature = "test-universal")]
 #[test]
@@ -18206,6 +18374,65 @@ fn lock_metadata_free_shared_disjoint_marker_direct_sources() -> Result<()> {
         version = "0.1.0"
         requires-python = ">=3.12"
         dependencies = ["httpx @ {httpx_url} ; sys_platform == 'darwin'"]
+        "#,
+            httpx_url = server.file_url("httpx-1.0.0-py3-none-any.whl"),
+        })?;
+
+    uv_snapshot!(context.filters(), context.lock()
+        .arg("--preview-features")
+        .arg("lock-without-metadata")
+        .arg("--index-url")
+        .arg(server.index_url()), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    ");
+
+    uv_snapshot!(context.filters(), context.lock()
+        .arg("--preview-features")
+        .arg("lock-without-metadata")
+        .arg("--check")
+        .arg("--offline")
+        .arg("--no-cache")
+        .arg("--index-url")
+        .arg(server.index_url()), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    ");
+
+    Ok(())
+}
+
+/// Direct sources selected by a non-workspace local dependency are shared across the resolution.
+#[cfg(feature = "test-universal")]
+#[test]
+fn lock_metadata_free_shared_transitive_direct_source() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let server = PackseServer::new("extras/lock-without-metadata.toml");
+
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(indoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["httpx", "local"]
+
+        [tool.uv.sources]
+        local = { path = "local" }
+        "#})?;
+    context
+        .temp_dir
+        .child("local/pyproject.toml")
+        .write_str(&formatdoc! {r#"
+        [project]
+        name = "local"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["httpx @ {httpx_url}"]
         "#,
             httpx_url = server.file_url("httpx-1.0.0-py3-none-any.whl"),
         })?;
