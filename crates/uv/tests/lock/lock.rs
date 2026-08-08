@@ -25,6 +25,20 @@ use uv_test::{READ_ONLY_GITHUB_TOKEN, decode_token};
 #[cfg(feature = "test-universal")]
 use uv_test::{download_to_disk, venv_bin_path};
 
+/// Generate the preview lock without package metadata.
+#[cfg(feature = "test-universal")]
+fn lock_without_package_metadata(lock: &str) -> Result<toml_edit::DocumentMut> {
+    let mut lock = lock.parse::<toml_edit::DocumentMut>()?;
+    let Some(packages) = lock["package"].as_array_of_tables_mut() else {
+        anyhow::bail!("lockfile did not contain a package array");
+    };
+    for package in packages.iter_mut() {
+        package.remove("metadata");
+    }
+    lock["revision"] = toml_edit::value(4);
+    Ok(lock)
+}
+
 #[cfg(feature = "test-universal")]
 #[test]
 fn lock_preserves_noncanonical_lock() -> Result<()> {
@@ -3538,6 +3552,35 @@ fn lock_conflicting_project_basic1() -> Result<()> {
      - project==0.1.0 (from file://[TEMP_DIR]/)
      - sortedcontainers==2.3.0
      + sortedcontainers==2.4.0
+    ");
+
+    let lock_without_metadata = lock_without_package_metadata(&lock)?;
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&lock_without_metadata.to_string())?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("package-conflicts,lock-without-metadata").arg("--check").arg("--offline").arg("--no-cache"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    ");
+
+    let missing_conflict_marker = lock_without_metadata
+        .to_string()
+        .replace(", marker = \"extra == 'project-7-project'\"", "");
+    context
+        .temp_dir
+        .child("uv.lock")
+        .write_str(&missing_conflict_marker)?;
+
+    uv_snapshot!(context.filters(), context.lock().arg("--preview-features").arg("package-conflicts,lock-without-metadata").arg("--locked"), @"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    error: The lockfile at `uv.lock` needs to be updated, but `--locked` was provided.
+
+    hint: To update the lockfile, run `uv lock`.
     ");
 
     Ok(())
