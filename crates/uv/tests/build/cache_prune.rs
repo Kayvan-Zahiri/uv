@@ -34,6 +34,30 @@ fn prune_no_op() -> Result<()> {
     Ok(())
 }
 
+/// `cache prune` should count allocated blocks without counting sparse file holes.
+#[cfg(unix)]
+#[test]
+fn prune_allocated_blocks() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+
+    let stale = context.cache_dir.child("stale-v0");
+    stale.create_dir_all()?;
+    stale
+        .child("cached.bin")
+        .write_binary(&vec![42; 1024 * 1024 - 512])?;
+    fs_err::File::create(stale.child("sparse.bin").path())?.set_len(1024 * 1024)?;
+
+    // Counting logical sizes, including the sparse file's hole, would report 2.0MiB.
+    uv_snapshot!(context.filters(), context.prune(), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Pruning cache at: [CACHE_DIR]/
+    Removed 2 files (1.0MiB)
+    ");
+
+    Ok(())
+}
+
 /// `cache prune` should report physical space for hardlinks only when the preview is enabled.
 #[cfg(unix)]
 #[test]

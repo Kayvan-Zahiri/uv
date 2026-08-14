@@ -3,6 +3,8 @@
 //! Source: <https://github.com/rust-lang/cargo/blob/e1ebce1035f9b53bb46a55bd4b0ecf51e24c6458/src/cargo/ops/cargo_clean.rs#L324>
 
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use tracing::debug;
@@ -12,7 +14,7 @@ use crate::CleanReporter;
 /// The storage accounting used when removing cache entries.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum RemovalMode {
-    /// Report the logical size of the removed files.
+    /// Report the estimated size of the removed files without accounting for shared storage.
     #[default]
     Logical,
     /// Report the exclusively owned physical storage reclaimed by the removed files.
@@ -61,10 +63,11 @@ pub struct Removal {
     pub num_files: u64,
     /// The number of directories removed.
     pub num_dirs: u64,
-    /// The logical number of bytes removed.
+    /// The estimated number of bytes occupied by the removed files.
     ///
-    /// Note: this will both over-count bytes removed for hard-linked files, and under-count
-    /// bytes in general since it's a measure of the exact byte size (as opposed to the block size).
+    /// On Unix, this measures allocated filesystem blocks. On other platforms, it measures the
+    /// logical file sizes. Shared storage, such as hard links and copy-on-write clones, may be
+    /// counted more than once.
     pub logical_bytes: u64,
     /// The exclusively owned physical file data reclaimed by the removal, when available.
     pub physical_bytes: Option<u64>,
@@ -86,7 +89,15 @@ impl Removal {
 
     /// Account for a file while its current sharing state can still be inspected.
     fn add_file(&mut self, path: &Path, metadata: &std::fs::Metadata) {
-        self.logical_bytes += metadata.len();
+        #[cfg(unix)]
+        {
+            self.logical_bytes += metadata.blocks().saturating_mul(512);
+        }
+
+        #[cfg(not(unix))]
+        {
+            self.logical_bytes += metadata.len();
+        }
 
         if let Some(physical_bytes) = self.physical_bytes {
             match uv_fs::physical_space(path, metadata) {

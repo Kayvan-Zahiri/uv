@@ -41,6 +41,31 @@ fn clean_all() -> Result<()> {
     Ok(())
 }
 
+/// `cache clean` should round file sizes up to allocated filesystem blocks on Unix.
+#[cfg(unix)]
+#[test]
+fn clean_all_allocated_blocks() -> Result<()> {
+    let context = uv_test::test_context!("3.12").with_filtered_counts();
+
+    // Remove unrelated cache entries so the snapshot reflects only the allocated file.
+    context.clean().assert().success();
+    context.cache_dir.create_dir_all()?;
+    context
+        .cache_dir
+        .child("cached.bin")
+        .write_binary(&vec![42; 1024 * 1024 - 512])?;
+
+    // Reporting the logical file size would produce 1023.5KiB instead of 1.0MiB.
+    uv_snapshot!(context.filters(), context.clean(), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Clearing cache at: [CACHE_DIR]/
+    Removed [N] files (1.0MiB)
+    ");
+
+    Ok(())
+}
+
 /// `cache clean` should report physical space for hardlinks only when the preview is enabled.
 #[cfg(unix)]
 #[test]
