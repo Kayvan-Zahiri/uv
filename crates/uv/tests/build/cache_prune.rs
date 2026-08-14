@@ -58,7 +58,7 @@ fn prune_allocated_blocks() -> Result<()> {
     Ok(())
 }
 
-/// `cache prune` should report physical space for hardlinks only when the preview is enabled.
+/// `cache prune` should not count storage retained by another hardlink.
 #[cfg(unix)]
 #[test]
 fn prune_hardlinked_file() -> Result<()> {
@@ -76,11 +76,12 @@ fn prune_hardlinked_file() -> Result<()> {
     stale.create_dir_all()?;
     fs_err::hard_link(&retained, stale.child("hardlinked.bin"))?;
 
+    // Counting the externally retained hardlink would incorrectly report 1.0MiB.
     uv_snapshot!(context.filters(), context.prune(), @"
     exit_code: 0 (success)
     ----- stderr -----
     Pruning cache at: [CACHE_DIR]/
-    Removed 1 file (1.0MiB)
+    Removed 1 file
     ");
 
     stale.create_dir_all()?;

@@ -66,11 +66,15 @@ fn clean_all_allocated_blocks() -> Result<()> {
     Ok(())
 }
 
-/// `cache clean` should report physical space for hardlinks only when the preview is enabled.
+/// `cache clean` should count hardlinked storage only when its final link is removed.
 #[cfg(unix)]
 #[test]
 fn clean_all_hardlinked_file() -> Result<()> {
     let context = uv_test::test_context!("3.12").with_filtered_counts();
+
+    // Remove unrelated cache entries so retained hardlinks contribute no allocated space.
+    context.clean().assert().success();
+    context.cache_dir.create_dir_all()?;
 
     // Keep the retained hardlink beside the cache so both entries share a filesystem.
     let retained = context.cache_dir.path().with_file_name("retained.bin");
@@ -83,11 +87,12 @@ fn clean_all_hardlinked_file() -> Result<()> {
     let cached = context.cache_dir.child("hardlinked.bin");
     fs_err::hard_link(&retained, &cached)?;
 
+    // Counting the externally retained hardlink would incorrectly report 1.0MiB.
     uv_snapshot!(context.filters(), context.clean(), @"
     exit_code: 0 (success)
     ----- stderr -----
     Clearing cache at: [CACHE_DIR]/
-    Removed [N] files (1.0MiB)
+    Removed [N] files
     ");
 
     context.cache_dir.create_dir_all()?;
@@ -101,6 +106,22 @@ fn clean_all_hardlinked_file() -> Result<()> {
     ");
 
     assert!(retained.is_file());
+
+    context.cache_dir.create_dir_all()?;
+    cached.write_binary(&vec![42; 1024 * 1024])?;
+    fs_err::OpenOptions::new()
+        .write(true)
+        .open(cached.path())?
+        .sync_all()?;
+    fs_err::hard_link(&cached, context.cache_dir.child("second-hardlink.bin"))?;
+
+    // Counting each hardlink separately would incorrectly report 2.0MiB.
+    uv_snapshot!(context.filters(), context.clean(), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Clearing cache at: [CACHE_DIR]/
+    Removed [N] files (1.0MiB)
+    ");
 
     context.cache_dir.create_dir_all()?;
     cached.write_binary(&vec![42; 1024 * 1024])?;

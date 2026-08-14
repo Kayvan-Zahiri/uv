@@ -86,9 +86,12 @@ pub(crate) async fn cache_prune(
         }
     }
 
-    // If any, report the physical space, falling back to the logical removed size.
+    // If any, report the physical space, falling back to the basic removed size.
     let reported_bytes = summary.physical_bytes.unwrap_or(summary.logical_bytes);
-    if summary.logical_bytes > 0 || reported_bytes > 0 {
+    if summary.logical_bytes > 0
+        || reported_bytes > 0
+        || (summary.physical_bytes.is_some() && summary.num_files > 0)
+    {
         let bytes = if reported_bytes < 1024 {
             format!("{reported_bytes}B")
         } else {

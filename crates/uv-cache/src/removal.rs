@@ -14,7 +14,7 @@ use crate::CleanReporter;
 /// The storage accounting used when removing cache entries.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum RemovalMode {
-    /// Report the estimated size of the removed files without accounting for shared storage.
+    /// Report the estimated size of the removed files without accounting for copy-on-write clones.
     #[default]
     Logical,
     /// Report the exclusively owned physical storage reclaimed by the removed files.
@@ -65,9 +65,9 @@ pub struct Removal {
     pub num_dirs: u64,
     /// The estimated number of bytes occupied by the removed files.
     ///
-    /// On Unix, this measures allocated filesystem blocks. On other platforms, it measures the
-    /// logical file sizes. Shared storage, such as hard links and copy-on-write clones, may be
-    /// counted more than once.
+    /// On Unix, this measures allocated filesystem blocks and excludes storage retained by other
+    /// hard links. On other platforms, it measures the logical file sizes. Copy-on-write clones may
+    /// be counted more than once.
     pub logical_bytes: u64,
     /// The exclusively owned physical file data reclaimed by the removal, when available.
     pub physical_bytes: Option<u64>,
@@ -91,7 +91,9 @@ impl Removal {
     fn add_file(&mut self, path: &Path, metadata: &std::fs::Metadata) {
         #[cfg(unix)]
         {
-            self.logical_bytes += metadata.blocks().saturating_mul(512);
+            if metadata.nlink() == 1 {
+                self.logical_bytes += metadata.blocks().saturating_mul(512);
+            }
         }
 
         #[cfg(not(unix))]
