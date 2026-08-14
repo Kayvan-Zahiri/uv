@@ -297,18 +297,45 @@ pub fn input(prompt: &str, term: &Term) -> std::io::Result<String> {
     Ok(input)
 }
 
-/// Formats a number of bytes into a human readable SI-prefixed size (binary units).
+/// Formats a number of bytes into a human readable IEC-prefixed size (binary units).
 ///
 /// Returns a tuple of `(quantity, units)`.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
+///
+/// Units are selected assuming the quantity will be displayed with one decimal place.
+#[expect(clippy::cast_precision_loss)]
 pub fn human_readable_bytes(bytes: u64) -> (f32, &'static str) {
     const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-    let bytes_f32 = bytes as f32;
-    let i = ((bytes_f32.log2() / 10.0) as usize).min(UNITS.len() - 1);
-    (bytes_f32 / 1024_f32.powi(i as i32), UNITS[i])
+    let mut quantity = bytes as f32;
+    let mut unit_index = 0;
+
+    // Promote values that would round to 1024.0 with one decimal place.
+    while quantity >= 1023.95 && unit_index + 1 < UNITS.len() {
+        quantity /= 1024.0;
+        unit_index += 1;
+    }
+
+    (quantity, UNITS[unit_index])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human_readable_bytes;
+
+    #[test]
+    fn human_readable_sizes() {
+        let format = |bytes| {
+            let (quantity, units) = human_readable_bytes(bytes);
+            format!("{quantity:.1}{units}")
+        };
+
+        assert_eq!(format(0), "0.0B");
+        assert_eq!(format(1023), "1023.0B");
+        assert_eq!(format(1024), "1.0KiB");
+        assert_eq!(format(1024 * 1024 - 52), "1023.9KiB");
+        assert_eq!(format(1024 * 1024 - 51), "1.0MiB");
+        assert_eq!(format(1024 * 1024 - 1), "1.0MiB");
+        assert_eq!(format(1024 * 1024), "1.0MiB");
+        assert_eq!(format(1024 * 1024 * 1024 - 1), "1.0GiB");
+        assert_eq!(format(u64::MAX), "16.0EiB");
+    }
 }
